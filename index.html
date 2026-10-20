@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#F2F2F7" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0E0F10" media="(prefers-color-scheme: dark)">
+<title>RSfishnet</title>
+<style>
+    :root{--bg:#F2F2F7;--text:#1C1C1E;--text2:#6C6C70;--accent:#0F6B66;--on:#fff;--line:rgba(60,60,67,.12)}
+    @media (prefers-color-scheme: dark){
+        :root{--bg:#0E0F10;--text:#F2F2F7;--text2:#9A9A9F;--accent:#35C2B6;--on:#07211F;--line:rgba(255,255,255,.08)}
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{margin:0;background:var(--bg);color:var(--text);display:grid;place-items:center;
+        font:400 17px/1.45 -apple-system,BlinkMacSystemFont,system-ui,sans-serif;-webkit-font-smoothing:antialiased;
+        padding:24px;user-select:none}
+    .box{width:100%;max-width:340px;text-align:center}
+    h1{margin:0 0 6px;font-size:24px;font-weight:600;letter-spacing:-.02em}
+    p{margin:0;color:var(--text2);font-size:14px;min-height:22px}
+    button{margin-top:26px;width:100%;height:48px;border:0;border-radius:12px;background:var(--accent);color:var(--on);
+        font:600 16px system-ui;transition:transform .12s}
+    button:active{transform:scale(.98)}
+    button:disabled{opacity:.55}
+    .bar{margin-top:18px;height:4px;border-radius:2px;background:var(--line);overflow:hidden;visibility:hidden}
+    .bar.show{visibility:visible}
+    .bar i{display:block;height:100%;width:0;background:var(--accent);transition:width .15s}
+</style>
+<div class="box">
+    <h1>RSfishnet</h1>
+    <p id="status" aria-live="polite">连接设备后读取内置页面</p>
+    <button id="go">连接设备</button>
+    <div class="bar" id="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i></i></div>
+</div>
+<script>
+(() => {
+    'use strict';
+    // 协议：写 0xFF11 命令 → 读长度 → 通知推送数据（bit31 = gzip）
+    // CMD 用负数字面量：u32le 的 & 255 会把它还原成 0xFFFFFFFF/FD/FE 同款字节
+    const SVC = '6ba1b218-15a8-461f-9fa8-5dcae273eafd', PAGE = 0xff11, CMD = { LEN: -1, START: -3, STOP: -2 };
+
+    const $ = s => document.querySelector(s), $status = $('#status'), $bar = $('#bar'), $go = $('#go');
+    const status = s => $status.textContent = s;
+    const progress = p => { p = p * 100 | 0; $bar.className = 'bar show'; $bar.ariaValueNow = p; $bar.firstElementChild.style.width = p + '%' };
+    const u32le = n => new Uint8Array([n, n >>> 8, n >>> 16, n >>> 24].map(v => v & 255));
+    const once = (t, ev) => new Promise(r => t.addEventListener(ev, r, { once: true }));
+
+    // 事件流 → 异步迭代器（Go channel + for range 的 JS 形态）
+    async function* events(t, n) {
+        const q = []; let w = 0;
+        const push = e => { q.push(e); w?.(); w = 0 };
+        t.addEventListener(n, push);
+        try { for (;;) { if (!q.length) await new Promise(r => w = r); yield q.shift() } }
+        finally { t.removeEventListener(n, push) } // 消费方 break / return / 异常都会走到
+    }
+
+    async function connectGatt(d) { // 断连偶发，重试 3 次
+        for (let i = 0; ; i++) try { return await (await d.gatt.connect()).getPrimaryService(SVC) }
+        catch (e) { if (i > 1) throw e; d.gatt.disconnect(); await new Promise(r => setTimeout(r, 700)) }
+    }
+
+    async function pull(page, dev, total) { // 拉 total 字节直写预分配 buffer
+        const buf = new Uint8Array(total); let off = 0, timer;
+        const stream = events(page, 'characteristicvaluechanged');
+        const dead = new Promise((_, f) => timer = setTimeout(() => f(Error(`推送超时（${off}/${total}）`)), 30_000));
+        const disc = once(dev, 'gattserverdisconnected').then(() => { throw Error('蓝牙连接中断，请重试') });
+        status('正在读取内置页面…');
+        await page.startNotifications(); // 必须先订阅再 START：顺序反了首包会丢
+        const pump = (async () => { await page.writeValue(u32le(CMD.START));
+            for await (const { target: t } of stream) {
+                const c = new Uint8Array(t.value.buffer, t.value.byteOffset, t.value.byteLength), n = Math.min(c.length, total - off);
+                buf.set(c.subarray(0, n), off); off += n; progress(off / total);
+                if (off >= total) return
+            } })();
+        try { await Promise.race([pump, disc, dead]) } // select：收完 / 断连 / 超时
+        finally { clearTimeout(timer); await stream.return(); await Promise.allSettled([page.writeValue(u32le(CMD.STOP)), page.stopNotifications()]) }
+        return buf;
+    }
+
+    async function fetchPage(dev) {
+        const page = await (await connectGatt(dev)).getCharacteristic(PAGE);
+        await page.writeValue(u32le(CMD.LEN));
+        const meta = await page.readValue();
+        if (meta.byteLength < 4) throw Error('长度读取失败');
+        const v = meta.getUint32(0, !0), total = v & 0x7fffffff;
+        if (!total || total > 1 << 20) throw Error('页面长度异常: ' + total);
+        const buf = await pull(page, dev, total);
+        if (!(v & 0x80000000)) return new TextDecoder().decode(buf);
+        if (!window.DecompressionStream) throw Error('浏览器不支持解压，请升级');
+        return new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream('gzip'))).text();
+    }
+
+    function mountPage(html) {
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        document.head.querySelectorAll('style, title').forEach(e => e.remove());
+        document.head.append(...doc.head.querySelectorAll('style, title'));
+        document.body.innerHTML = doc.body.innerHTML;
+        for (const src of doc.querySelectorAll('script:not([src])')) {
+            const s = document.createElement('script'); s.textContent = src.textContent; document.body.append(s);
+        }
+    }
+
+    async function loadFrom(dev) {
+        $go.disabled = 1;
+        try {
+            dev ??= (status('正在选择设备…'), await navigator.bluetooth.requestDevice({ filters: [{ services: [SVC] }] }));
+            status('正在连接 ' + (dev.name || dev.id) + ' …');
+            const html = await fetchPage(dev);
+            try { localStorage.setItem('rsf.app', html) } catch {}
+            dev.gatt.disconnect();
+            // 重载时旧连接随文档销毁，新页面用缓存秒开；去掉查询参数避免 fresh/local 让缓存永不生效而循环重取
+            location.replace(location.pathname);
+        } catch (e) { status('失败：' + (e?.message ?? e)); $go.disabled = 0 }
+    }
+
+    $go.onclick = () => loadFrom();
+
+    // 启动路径：?local=1 本地调试；?fresh=1 强制重拉；默认有缓存秒开
+    (async () => {
+        const q = new URLSearchParams(location.search);
+        if (q.get('local') == '1') try { mountPage(await (await fetch('/app.html?v=' + Date.now())).text()); return }
+        catch (e) { status('本地页面加载失败：' + e.message) } // 失败继续走缓存/蓝牙
+        if (q.get('fresh') != '1' && localStorage.getItem('rsf.app')) { mountPage(localStorage.getItem('rsf.app')); return }
+        if (!navigator.bluetooth) { status('当前浏览器不支持网页蓝牙（Mac/PC 用 Chrome，iOS 用 Bluefy）'); return }
+        try { const [d] = await navigator.bluetooth.getDevices?.(); d && await loadFrom(d) } catch {}
+    })();
+
+})();
+</script>
+</html>
